@@ -14,38 +14,59 @@ bash path/to/fagents-tty/setup.sh
 
 Setup writes:
 
-- `<your-project>/.fagents-tty/{bin,sessions,config,.gitignore}` (per-project),
-- `~/.fagents-tty/registry/<project>/.path` (global; one line containing the project's absolute path, so the registry slot for that project name is claimed at install time and cannot be silently taken over by another project later -- see "Project-name conflicts" below).
+- `<your-project>/.fagents-tty/{bin,sessions,config,.gitignore}` -- the comms toolkit, project-local.
+- `~/.fagents-tty/registry/<project>/.path` -- one line containing the project's absolute path. Claims the registry slot for that project name at install time so it cannot be silently taken over by another project later (see "Project-name conflicts" below).
+- `<your-project>/launch-claude` and `<your-project>/launch-codex` -- launcher scripts that register your TTY in tandem and fagents-tty (if either is installed) before exec'ing the CLI. If a launcher with the same name already exists (e.g. from a previous tandem install), setup amends it in place by inserting one register line before `exec`. Override the agent list with `--agents <comma-list>`, opt out with `--no-launchers`.
+- `<your-project>/.claude/skills/fagents-tty/SKILL.md` and `<your-project>/.codex/skills/fagents-tty/SKILL.md` -- project-local agent skills explaining the cross-project msging convention. Opt out with `--no-skill`.
 
 Setup deliberately does NOT:
 
 - modify `.claude/settings.json` or `.codex/hooks.json`,
-- overwrite any top-level launcher script,
-- install the agent skill globally to `~/.claude/skills/` or `~/.codex/skills/`.
-
-The skill is opt-in (see below).
+- write to `~/.claude/skills/` or `~/.codex/skills/` (no global skill install),
+- overwrite the `exec` line or arg-handling of an existing launcher.
 
 ### Project-name conflicts
 
 If `~/.fagents-tty/registry/<name>/.path` already exists and points to a different absolute project path, setup refuses with exit 1. Re-run with `--force` to take over (the previous registry directory is removed before the new `.path` is written). Pick a different `--project <name>` if you would rather keep both.
 
-## Optional: install the skill
+### Flags
 
-`skill/SKILL.md` teaches the agent how to register, send, and reply. fagents-tty does NOT auto-install it because that would leak into every Claude / Codex session on the host, including projects that have nothing to do with fagents-tty.
+```
+bash setup.sh                          # install in current dir; default agents = claude,codex
+bash setup.sh --project <name>         # explicit project name (default: basename)
+bash setup.sh --force                  # override registry slot conflict
+bash setup.sh --update                 # refresh bin scripts, launchers, and skills (idempotent)
+bash setup.sh --agents <comma-list>    # override default launcher list (rejects empty entries)
+bash setup.sh --no-launchers           # skip launcher install
+bash setup.sh --no-skill               # skip per-project skill install
+```
 
-Pick the scope you want:
+## Launchers
 
-- **Per-project** (Claude Code reads `<project>/.claude/skills/`): from your project root, run `mkdir -p .claude/skills && ln -s /path/to/fagents-tty/skill .claude/skills/fagents-tty`. The skill is then loaded only in agents launched from this project.
-- **Per-user** (every Claude session sees it): `ln -s /path/to/fagents-tty/skill ~/.claude/skills/fagents-tty`. Same for `~/.codex/skills/fagents-tty` if you use Codex.
-- **None**: skip. The wake envelope already contains the verbatim reply command, so an agent without the skill can still respond correctly.
+Each `launch-<agent>` does four things:
 
-## Register (once per session)
+1. Resolves `ROOT` to the launcher's own directory.
+2. If `.tandem/bin/handoff.sh` is executable, calls `handoff.sh register <agent>`.
+3. If `.fagents-tty/bin/comms.sh` is executable, calls `comms.sh register <agent>`.
+4. `exec <agent> "$@"` so CLI args (e.g. `./launch-claude --resume`) pass through.
+
+If an existing launcher has no `ROOT=` definition or no `exec` line, setup prints a warning with the exact line you need to add and continues without modifying the file. The warning is non-blocking (setup exits 0).
+
+For non-CLI-named agents (e.g. `--agents orchestrator`), the launcher's `exec orchestrator "$@"` line will not work unless `orchestrator` is on `$PATH`. Edit the exec line to point at the actual binary you use (`exec claude "$@"`, `exec codex "$@"`, etc.).
+
+## Register
+
+Launchers register automatically. If you start your session via `./launch-claude` (or whatever launcher you adapted), your TTY is already in the registry. Confirm with:
+
+```bash
+bash .fagents-tty/bin/comms.sh status
+```
+
+If you bypassed the launcher, register manually:
 
 ```bash
 bash .fagents-tty/bin/comms.sh register <agent-name>
 ```
-
-Writes your TTY to a global registry at `~/.fagents-tty/registry/<project>/<agent>.tty`. After this, other projects can msg you as `<project>:<agent>`.
 
 ## Send a message
 
@@ -107,9 +128,8 @@ Uses TIOCSTI to inject keystrokes into the target TTY. Requires NOPASSWD sudo fo
 - Different dirs: `.fagents-tty/` vs `.tandem/`. No shared files.
 - Different registries: tandem uses per-project `.tandem/<agent>.tty`; fagents-tty uses global `~/.fagents-tty/registry/<project>/<agent>.tty`.
 - Different prefixes: tandem injects `[claude]:` / `[codex]:`; fagents-tty injects `[FAGENTS-TTY from X:Y]:`.
-- No hook installation. No launcher overwrite. `setup.sh` writes only `<project>/.fagents-tty/` and the registry slot file `~/.fagents-tty/registry/<project>/.path` (see "Setup" above); it never touches tandem's `.tandem/` directory or its scripts.
-
-If you want auto-registration on session start, copy `templates/launch-orchestrator` to your project and adapt it.
+- No hook installation, no global skill install. fagents-tty `setup.sh` writes only `<project>/.fagents-tty/`, the registry slot file `~/.fagents-tty/registry/<project>/.path`, project-local launchers (`./launch-<agent>`), and project-local skills (`<project>/.claude/skills/fagents-tty/`, `<project>/.codex/skills/fagents-tty/`).
+- Existing tandem launchers (`./launch-claude` from `fagents-tandem` setup) are amended in place with a single register line; tandem's existing TTY-write logic and `exec ... "$@"` are preserved byte-for-byte.
 
 ## Tests
 
@@ -117,7 +137,7 @@ If you want auto-registration on session start, copy `templates/launch-orchestra
 bash test/test_comms.sh
 ```
 
-44 test functions, 121 assertions. All TIOCSTI is mocked; the python encode path that real `wake.sh` uses is verified independently in test 41 (split UTF-8 from argv -> `os.fsencode` -> byte-by-byte ioctl payload, no `UnicodeEncodeError`). Real-TTY smoke test is manual:
+60 numbered tests plus `test_58b` (the permission-repair regression), 192 assertions. All TIOCSTI is mocked; the python encode path that real `wake.sh` uses is verified independently in test 41 (split UTF-8 from argv -> `os.fsencode` -> byte-by-byte ioctl payload, no `UnicodeEncodeError`). Real-TTY smoke test is manual:
 
 ```bash
 # In project A (your TTY = /dev/ttysN):
@@ -134,4 +154,4 @@ bash .fagents-tty/bin/comms.sh msg <other>:<other> "smoke test"
 - Not a state machine or protocol (that's `fagents-tandem`).
 - Not cross-host -- local TTYs only.
 - Not authenticated -- same host, same UID assumed. Sender prefix is self-asserted.
-- Not durable -- TIOCSTI fire-and-forget. If you need replay or queuing, an inbox.jsonl is the obvious v1.1 add.
+- Not durable -- TIOCSTI fire-and-forget. If you need replay or queuing, an inbox.jsonl is a future v1.x add.

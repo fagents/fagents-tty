@@ -865,15 +865,345 @@ test_44() {
     unset FAGENTS_TTY_REGISTRY_DIR TMPDIR
 }
 
+# ── v1.1: launcher + project-local skill install ──
+
+# Helper: bootstrap a clean install dir with fake HOME (used by v1.1 tests).
+# Sets TMPDIR, PROJ, FAKE_HOME, FAGENTS_TTY_REGISTRY_DIR. Caller cleans up.
+v11_bootstrap() {
+    local proj_name="$1"
+    TMPDIR=$(cd "$(mktemp -d)" && pwd -P)
+    PROJ="$TMPDIR/$proj_name"
+    mkdir -p "$PROJ"
+    FAKE_HOME="$TMPDIR/fake_home"
+    mkdir -p "$FAKE_HOME"
+    export FAGENTS_TTY_REGISTRY_DIR="$TMPDIR/registry"
+}
+
+v11_teardown() {
+    rm -rf "$TMPDIR"
+    unset FAGENTS_TTY_REGISTRY_DIR TMPDIR PROJ FAKE_HOME
+}
+
+# Run setup.sh from PROJ with isolated HOME. Captures stdout+stderr and rc.
+v11_run_setup() {
+    SETUP_OUT=$(cd "$PROJ" && HOME="$FAKE_HOME" bash "$REPO_ROOT/setup.sh" "$@" 2>&1)
+    SETUP_RC=$?
+}
+
+# Launcher creation, fresh
+test_45() {
+    v11_bootstrap "launcher_default"
+    v11_run_setup --project launcher_default
+    assert "test 45a: setup exits 0" "$SETUP_RC" "0"
+    assert_file_exists "test 45b: launch-claude created" "$PROJ/launch-claude"
+    assert_file_exists "test 45c: launch-codex created" "$PROJ/launch-codex"
+    local m_claude m_codex
+    m_claude=$(file_mode "$PROJ/launch-claude")
+    m_codex=$(file_mode "$PROJ/launch-codex")
+    assert "test 45d: launch-claude mode 700" "$m_claude" "700"
+    assert "test 45e: launch-codex mode 700" "$m_codex" "700"
+    v11_teardown
+}
+
+test_46() {
+    v11_bootstrap "launcher_agents"
+    v11_run_setup --project launcher_agents --agents orchestrator,foo
+    assert "test 46a: setup exits 0" "$SETUP_RC" "0"
+    assert_file_exists "test 46b: launch-orchestrator created" "$PROJ/launch-orchestrator"
+    assert_file_exists "test 46c: launch-foo created" "$PROJ/launch-foo"
+    assert_file_missing "test 46d: launch-claude NOT created" "$PROJ/launch-claude"
+    assert_file_missing "test 46e: launch-codex NOT created" "$PROJ/launch-codex"
+    v11_teardown
+}
+
+test_47() {
+    v11_bootstrap "launcher_skip"
+    v11_run_setup --project launcher_skip --no-launchers
+    assert "test 47a: setup exits 0" "$SETUP_RC" "0"
+    assert_file_missing "test 47b: --no-launchers skips claude" "$PROJ/launch-claude"
+    assert_file_missing "test 47c: --no-launchers skips codex" "$PROJ/launch-codex"
+    v11_teardown
+}
+
+test_48() {
+    v11_bootstrap "launcher_content"
+    v11_run_setup --project launcher_content
+    assert "test 48a: setup exits 0" "$SETUP_RC" "0"
+    local content
+    content=$(cat "$PROJ/launch-claude")
+    # Literal $ROOT / $@ inside single quotes is intentional: we are asserting
+    # the launcher CONTAINS the literal string `$ROOT/...` (not its expansion).
+    # shellcheck disable=SC2016
+    assert_contains "test 48b: launcher defines ROOT" "$content" 'ROOT="$(cd '
+    # shellcheck disable=SC2016
+    assert_contains "test 48c: launcher has tandem conditional" "$content" '[ -x "$ROOT/.tandem/bin/handoff.sh" ] && bash "$ROOT/.tandem/bin/handoff.sh" register claude'
+    # shellcheck disable=SC2016
+    assert_contains "test 48d: launcher has fagents-tty conditional" "$content" '[ -x "$ROOT/.fagents-tty/bin/comms.sh" ] && bash "$ROOT/.fagents-tty/bin/comms.sh" register claude'
+    # shellcheck disable=SC2016
+    assert_contains "test 48e: launcher exec preserves args" "$content" 'exec claude "$@"'
+    v11_teardown
+}
+
+test_49() {
+    v11_bootstrap "launcher_idem"
+    v11_run_setup --project launcher_idem
+    local sha1
+    sha1=$(shasum -a 256 "$PROJ/launch-claude" | awk '{print $1}')
+    v11_run_setup --update
+    assert "test 49a: --update exits 0" "$SETUP_RC" "0"
+    assert_file_unchanged "test 49b: launch-claude idempotent under --update" "$PROJ/launch-claude" "$sha1"
+    v11_teardown
+}
+
+# Launcher amend via awk
+test_50() {
+    v11_bootstrap "amend_existing"
+    # Real fagents-tandem launch-claude content
+    cat > "$PROJ/launch-claude" <<'EOF'
+#!/bin/bash
+# Launch Claude Code with tandem TTY registration
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TTY_DEV=$(tty 2>/dev/null) || true
+[[ "$TTY_DEV" == /dev/* ]] && echo "$TTY_DEV" > "$ROOT/.tandem/claude.tty"
+exec claude "$@"
+EOF
+    chmod 0700 "$PROJ/launch-claude"
+    v11_run_setup --project amend_existing
+    assert "test 50a: setup exits 0" "$SETUP_RC" "0"
+    local content
+    content=$(cat "$PROJ/launch-claude")
+    # Original lines preserved (intentional literal $ROOT / $TTY_DEV / $@)
+    # shellcheck disable=SC2016
+    assert_contains "test 50b: tandem TTY-write line preserved" "$content" '[[ "$TTY_DEV" == /dev/* ]] && echo "$TTY_DEV" > "$ROOT/.tandem/claude.tty"'
+    # fagents-tty register line inserted
+    # shellcheck disable=SC2016
+    assert_contains "test 50c: fagents-tty register inserted" "$content" '[ -x "$ROOT/.fagents-tty/bin/comms.sh" ] && bash "$ROOT/.fagents-tty/bin/comms.sh" register claude'
+    # Exec line still has "$@"
+    # shellcheck disable=SC2016
+    assert_contains "test 50d: exec preserved with args" "$content" 'exec claude "$@"'
+    # The fagents-tty line must come BEFORE exec
+    local fagents_line exec_line
+    fagents_line=$(grep -n 'fagents-tty/bin/comms.sh' "$PROJ/launch-claude" | head -1 | cut -d: -f1)
+    exec_line=$(grep -n '^exec ' "$PROJ/launch-claude" | head -1 | cut -d: -f1)
+    if [ -n "$fagents_line" ] && [ -n "$exec_line" ] && [ "$fagents_line" -lt "$exec_line" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        FAILED_DETAILS+=("test 50e: fagents-tty line not before exec (fagents=$fagents_line, exec=$exec_line)")
+    fi
+    v11_teardown
+}
+
+test_51() {
+    v11_bootstrap "amend_idem"
+    cat > "$PROJ/launch-claude" <<'EOF'
+#!/bin/bash
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec claude "$@"
+EOF
+    chmod 0700 "$PROJ/launch-claude"
+    v11_run_setup --project amend_idem
+    local sha1
+    sha1=$(shasum -a 256 "$PROJ/launch-claude" | awk '{print $1}')
+    v11_run_setup --update
+    assert "test 51a: --update exits 0" "$SETUP_RC" "0"
+    assert_file_unchanged "test 51b: amended launcher idempotent" "$PROJ/launch-claude" "$sha1"
+    v11_teardown
+}
+
+test_52() {
+    v11_bootstrap "no_root"
+    # Launcher lacks ROOT= definition
+    cat > "$PROJ/launch-claude" <<'EOF'
+#!/bin/bash
+echo "hand-rolled"
+exec claude "$@"
+EOF
+    chmod 0700 "$PROJ/launch-claude"
+    local sha1
+    sha1=$(shasum -a 256 "$PROJ/launch-claude" | awk '{print $1}')
+    v11_run_setup --project no_root
+    assert "test 52a: setup exits 0 (non-blocking warning)" "$SETUP_RC" "0"
+    assert_contains "test 52b: setup printed manual instructions" "$SETUP_OUT" "does not define 'ROOT='"
+    assert_file_unchanged "test 52c: launcher unchanged" "$PROJ/launch-claude" "$sha1"
+    v11_teardown
+}
+
+test_53() {
+    v11_bootstrap "no_exec"
+    cat > "$PROJ/launch-claude" <<'EOF'
+#!/bin/bash
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "no exec here"
+EOF
+    chmod 0700 "$PROJ/launch-claude"
+    local sha1
+    sha1=$(shasum -a 256 "$PROJ/launch-claude" | awk '{print $1}')
+    v11_run_setup --project no_exec
+    assert "test 53a: setup exits 0 (non-blocking warning)" "$SETUP_RC" "0"
+    assert_contains "test 53b: setup printed manual instructions" "$SETUP_OUT" "no 'exec' line"
+    assert_file_unchanged "test 53c: launcher unchanged" "$PROJ/launch-claude" "$sha1"
+    v11_teardown
+}
+
+test_54() {
+    v11_bootstrap "multi_exec"
+    cat > "$PROJ/launch-claude" <<'EOF'
+#!/bin/bash
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec claude "$@"
+exec codex "$@"
+EOF
+    chmod 0700 "$PROJ/launch-claude"
+    v11_run_setup --project multi_exec
+    assert "test 54a: setup exits 0" "$SETUP_RC" "0"
+    # Register line should appear ONCE, before the FIRST exec
+    local register_count
+    register_count=$(grep -c 'fagents-tty/bin/comms.sh.*register claude' "$PROJ/launch-claude")
+    assert "test 54b: register line inserted once" "$register_count" "1"
+    local fagents_line first_exec_line
+    fagents_line=$(grep -n 'fagents-tty/bin/comms.sh' "$PROJ/launch-claude" | head -1 | cut -d: -f1)
+    first_exec_line=$(grep -n '^exec ' "$PROJ/launch-claude" | head -1 | cut -d: -f1)
+    if [ -n "$fagents_line" ] && [ "$fagents_line" -lt "$first_exec_line" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        FAILED_DETAILS+=("test 54c: register not before first exec")
+    fi
+    v11_teardown
+}
+
+# --agents parsing
+test_55() {
+    v11_bootstrap "agents_invalid"
+    local bad rc
+    for bad in "" "," ",claude" "claude," "claude,,codex" "claude, ,codex" " claude"; do
+        v11_run_setup --project agents_invalid --agents "$bad"
+        rc=$SETUP_RC
+        if [ "$rc" -eq 1 ]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            FAILED_DETAILS+=("test 55: --agents '$bad' should fail (got rc=$rc)")
+        fi
+    done
+    v11_teardown
+}
+
+test_56() {
+    v11_bootstrap "agents_valid"
+    v11_run_setup --project agents_valid --agents "alpha,beta,gamma"
+    assert "test 56a: 3 valid agents exits 0" "$SETUP_RC" "0"
+    assert_file_exists "test 56b: launch-alpha" "$PROJ/launch-alpha"
+    assert_file_exists "test 56c: launch-beta" "$PROJ/launch-beta"
+    assert_file_exists "test 56d: launch-gamma" "$PROJ/launch-gamma"
+    v11_teardown
+}
+
+# Project-local skill install
+test_57() {
+    v11_bootstrap "skill_install"
+    v11_run_setup --project skill_install
+    assert "test 57a: setup exits 0" "$SETUP_RC" "0"
+    assert_file_exists "test 57b: claude SKILL.md" "$PROJ/.claude/skills/fagents-tty/SKILL.md"
+    assert_file_exists "test 57c: codex SKILL.md" "$PROJ/.codex/skills/fagents-tty/SKILL.md"
+    local m_claude_file m_codex_file m_claude_dir m_codex_dir
+    m_claude_file=$(file_mode "$PROJ/.claude/skills/fagents-tty/SKILL.md")
+    m_codex_file=$(file_mode "$PROJ/.codex/skills/fagents-tty/SKILL.md")
+    m_claude_dir=$(file_mode "$PROJ/.claude/skills/fagents-tty")
+    m_codex_dir=$(file_mode "$PROJ/.codex/skills/fagents-tty")
+    assert "test 57d: claude SKILL.md mode 600" "$m_claude_file" "600"
+    assert "test 57e: codex SKILL.md mode 600" "$m_codex_file" "600"
+    assert "test 57f: claude skill dir mode 700" "$m_claude_dir" "700"
+    assert "test 57g: codex skill dir mode 700" "$m_codex_dir" "700"
+    v11_teardown
+}
+
+test_58() {
+    v11_bootstrap "no_skill"
+    v11_run_setup --project no_skill --no-skill
+    assert "test 58a: --no-skill exits 0" "$SETUP_RC" "0"
+    assert_file_missing "test 58b: claude skill dir absent" "$PROJ/.claude/skills/fagents-tty"
+    assert_file_missing "test 58c: codex skill dir absent" "$PROJ/.codex/skills/fagents-tty"
+    v11_teardown
+}
+
+# Permission repair: pre-existing permissive paths get tightened
+test_58b() {
+    v11_bootstrap "skill_repair"
+    mkdir -p "$PROJ/.claude/skills/fagents-tty"
+    chmod 0755 "$PROJ/.claude/skills/fagents-tty"
+    echo "stale" > "$PROJ/.claude/skills/fagents-tty/SKILL.md"
+    chmod 0644 "$PROJ/.claude/skills/fagents-tty/SKILL.md"
+    v11_run_setup --project skill_repair
+    assert "test 58b1: setup exits 0" "$SETUP_RC" "0"
+    local m_dir m_file
+    m_dir=$(file_mode "$PROJ/.claude/skills/fagents-tty")
+    m_file=$(file_mode "$PROJ/.claude/skills/fagents-tty/SKILL.md")
+    assert "test 58b2: pre-existing dir tightened to 700" "$m_dir" "700"
+    assert "test 58b3: pre-existing file tightened to 600" "$m_file" "600"
+    # Content overwritten to current SKILL.md
+    if grep -q 'fagents-tty' "$PROJ/.claude/skills/fagents-tty/SKILL.md"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        FAILED_DETAILS+=("test 58b4: pre-existing SKILL.md not overwritten with current content")
+    fi
+    v11_teardown
+}
+
+# No global pollution under fake HOME
+test_59() {
+    v11_bootstrap "no_global"
+    v11_run_setup --project no_global
+    assert "test 59a: setup exits 0" "$SETUP_RC" "0"
+    assert_file_missing "test 59b: fake HOME claude skills absent" "$FAKE_HOME/.claude/skills/fagents-tty/SKILL.md"
+    assert_file_missing "test 59c: fake HOME codex skills absent" "$FAKE_HOME/.codex/skills/fagents-tty/SKILL.md"
+    # Check the would-be parent dirs also don't exist
+    if [ ! -d "$FAKE_HOME/.claude/skills/fagents-tty" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        FAILED_DETAILS+=("test 59d: $FAKE_HOME/.claude/skills/fagents-tty unexpectedly exists")
+    fi
+    if [ ! -d "$FAKE_HOME/.codex/skills/fagents-tty" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        FAILED_DETAILS+=("test 59e: $FAKE_HOME/.codex/skills/fagents-tty unexpectedly exists")
+    fi
+    v11_teardown
+}
+
+# --update idempotency
+test_60() {
+    v11_bootstrap "update_idem"
+    v11_run_setup --project update_idem
+    local sha_claude sha_codex sha_skill_claude sha_skill_codex
+    sha_claude=$(shasum -a 256 "$PROJ/launch-claude" | awk '{print $1}')
+    sha_codex=$(shasum -a 256 "$PROJ/launch-codex" | awk '{print $1}')
+    sha_skill_claude=$(shasum -a 256 "$PROJ/.claude/skills/fagents-tty/SKILL.md" | awk '{print $1}')
+    sha_skill_codex=$(shasum -a 256 "$PROJ/.codex/skills/fagents-tty/SKILL.md" | awk '{print $1}')
+    v11_run_setup --update
+    assert "test 60a: --update exits 0" "$SETUP_RC" "0"
+    assert_file_unchanged "test 60b: launch-claude unchanged" "$PROJ/launch-claude" "$sha_claude"
+    assert_file_unchanged "test 60c: launch-codex unchanged" "$PROJ/launch-codex" "$sha_codex"
+    assert_file_unchanged "test 60d: claude SKILL.md unchanged" "$PROJ/.claude/skills/fagents-tty/SKILL.md" "$sha_skill_claude"
+    assert_file_unchanged "test 60e: codex SKILL.md unchanged" "$PROJ/.codex/skills/fagents-tty/SKILL.md" "$sha_skill_codex"
+    v11_teardown
+}
+
 # ── Main ──
 
 main() {
     local i
-    for i in $(seq 1 44); do
+    for i in $(seq 1 60); do
         if declare -f "test_$i" >/dev/null; then
             "test_$i"
         fi
     done
+    # test_58b is a named-suffix variant (permission repair) not covered by the seq loop.
+    if declare -f test_58b >/dev/null; then test_58b; fi
 
     echo ""
     echo "==============================="
