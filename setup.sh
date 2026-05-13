@@ -1,35 +1,30 @@
 #!/bin/bash
 # fagents-tty setup -- per-project installer.
 #
+# v2 model: project name == directory basename. No --project flag, no
+# config file, no global registry. State lives in <project>/.fagents-tty/.
+#
 # Usage:
-#   bash setup.sh                          # install in current dir, project_name = basename
-#   bash setup.sh --project <name>         # explicit project name
-#   bash setup.sh --force                  # override registry slot conflict
+#   bash setup.sh                          # install in current dir (basename = project name)
 #   bash setup.sh --update                 # refresh bin scripts + launchers + skill (idempotent)
 #   bash setup.sh --agents <comma-list>    # override default launcher list (default: claude,codex)
 #   bash setup.sh --no-launchers           # skip launcher install
-#   bash setup.sh --no-skill               # skip project-local skill install
+#   bash setup.sh --no-skill               # skip per-project skill install
 #
-# Creates <project>/.fagents-tty/{bin,sessions,config,.gitignore},
-# launcher scripts (./launch-<agent> for each --agents entry),
-# and per-project skills at <project>/.{claude,codex}/skills/fagents-tty/SKILL.md.
-# Does NOT modify .claude/settings.json or .codex/hooks.json. Does NOT install
-# any skill globally under ~/.claude/skills/ or ~/.codex/skills/.
+# Creates:
+#   <project>/.fagents-tty/{bin,.gitignore}
+#   <project>/launch-<agent>   (one per --agents entry; existing launchers are amended via awk)
+#   <project>/.{claude,codex}/skills/fagents-tty/SKILL.md
+# Does NOT modify .claude/settings.json or .codex/hooks.json.
 
 set -euo pipefail
 
-# Private-by-default for everything this script creates. 0700 dirs, 0600 files.
-# umask only applies to NEW paths; explicit chmod calls below handle the case
-# where a path already exists with looser permissions.
 umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_DIR="$(pwd -P)"
 FAGENTS_TTY_DIR="$PROJECT_DIR/.fagents-tty"
-REGISTRY_ROOT="${FAGENTS_TTY_REGISTRY_DIR:-$HOME/.fagents-tty/registry}"
 
-PROJECT_NAME=""
-FORCE=""
 UPDATE=""
 AGENTS_RAW=""
 NO_LAUNCHERS=""
@@ -37,7 +32,7 @@ NO_SKILL=""
 
 NAME_RE='^[A-Za-z0-9_][A-Za-z0-9_-]*$'
 
-# ── Helpers ──
+# -- Helpers --
 
 validate_name() {
     local name="$1"
@@ -45,12 +40,6 @@ validate_name() {
     [[ "$name" =~ $NAME_RE ]]
 }
 
-# Parse a comma-separated --agents value into the AGENTS_ARR global. Rejects
-# empty / leading-comma / trailing-comma / double-comma BEFORE splitting,
-# because `IFS=',' read -ra` silently drops trailing empty fields and would
-# otherwise let "claude," through. Inline (not a function) so an exit 1 here
-# kills setup.sh directly without a subshell swallowing the rc; also avoids
-# bash 4+ mapfile (macOS ships bash 3.2).
 populate_agents_arr_from_raw() {
     local raw="$1" agent
     [ -z "$raw" ] && { echo "invalid --agents value (empty)" >&2; exit 1; }
@@ -70,9 +59,6 @@ populate_agents_arr_from_raw() {
     done
 }
 
-# Write a fresh smart launcher for <agent> at <path>.
-# The launcher registers in tandem (.tandem/) and fagents-tty (.fagents-tty/)
-# if either is installed, then exec's the named CLI with all args.
 write_fresh_launcher() {
     local agent="$1" path="$2"
     cat > "$path" <<EOF
@@ -88,15 +74,8 @@ EOF
     chmod 0700 "$path"
 }
 
-# Amend an existing launcher in place: insert the fagents-tty register line
-# immediately before the first `exec` line. Idempotent (grep skip on second run).
-# Refuses to amend if the launcher lacks `ROOT=` or `exec `; in that case prints
-# manual instructions and exits 0 (non-blocking warning).
 amend_existing_launcher() {
     local agent="$1" path="$2"
-    # The $ROOT inside single quotes is INTENTIONAL: this string is inserted
-    # verbatim into the user's launcher, where $ROOT is the launcher's own
-    # variable. Only the trailing $agent should be expanded here.
     # shellcheck disable=SC2016
     local register_line='[ -x "$ROOT/.fagents-tty/bin/comms.sh" ] && bash "$ROOT/.fagents-tty/bin/comms.sh" register '"$agent"
 
@@ -156,17 +135,12 @@ install_project_skill() {
     local tool="$1"
     local skill_dir="$PROJECT_DIR/.${tool}/skills/fagents-tty"
     mkdir -p "$skill_dir"
-    # Explicit chmod is REQUIRED, not redundant: umask only applies to NEW
-    # paths; `mkdir -p` does not tighten an existing permissive directory,
-    # and `cp` over an existing file preserves the destination's mode.
     chmod 0700 "$skill_dir"
     cp "$SCRIPT_DIR/skill/SKILL.md" "$skill_dir/SKILL.md"
     chmod 0600 "$skill_dir/SKILL.md"
     echo "  Installed $tool skill: .${tool}/skills/fagents-tty/"
 }
 
-# Single source of truth for the launcher + skill install loop. Called from
-# both the fresh-install path and `--update` so the two stay in sync.
 install_launchers_and_skills() {
     if [ -z "$NO_LAUNCHERS" ]; then
         echo "Launchers:"
@@ -182,16 +156,37 @@ install_launchers_and_skills() {
     fi
 }
 
-# ── Arg parsing ──
+# v1.x cleanup: remove stale config file and sessions/ dir from a previous
+# install. Idempotent. Prints a single line if anything was actually removed,
+# so a fresh-on-v2 install stays quiet.
+cleanup_v1x_remnants() {
+    local removed=""
+    if [ -f "$FAGENTS_TTY_DIR/config" ]; then
+        rm -f "$FAGENTS_TTY_DIR/config"
+        removed="config"
+    fi
+    if [ -d "$FAGENTS_TTY_DIR/sessions" ]; then
+        rm -rf "$FAGENTS_TTY_DIR/sessions"
+        removed="${removed:+$removed, }sessions/"
+    fi
+    if [ -n "$removed" ]; then
+        echo "Removed stale v1.x files: $removed"
+    fi
+}
+
+# Print a non-blocking notice if the v1.x global registry exists.
+notice_global_v1x() {
+    if [ -d "$HOME/.fagents-tty/registry" ]; then
+        echo "Detected v1.x global registry at $HOME/.fagents-tty/registry/."
+        echo "v2 stores everything per-project; you can 'rm -rf $HOME/.fagents-tty'"
+        echo "once all your fagents-tty projects are migrated to v2."
+    fi
+}
+
+# -- Arg parsing --
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --project)
-            PROJECT_NAME="${2:-}"
-            [ -z "$PROJECT_NAME" ] && { echo "--project requires a value" >&2; exit 1; }
-            shift 2
-            ;;
-        --force) FORCE=1; shift ;;
         --update) UPDATE=1; shift ;;
         --agents)
             AGENTS_RAW="${2:-}"
@@ -201,15 +196,15 @@ while [ $# -gt 0 ]; do
         --no-launchers) NO_LAUNCHERS=1; shift ;;
         --no-skill) NO_SKILL=1; shift ;;
         --help|-h)
-            echo "Usage: bash setup.sh [--project <name>] [--force] [--update] [--agents <list>] [--no-launchers] [--no-skill]"
+            echo "Usage: bash setup.sh [--update] [--agents <list>] [--no-launchers] [--no-skill]"
             exit 0
             ;;
         *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
 done
 
-[ -z "$PROJECT_NAME" ] && PROJECT_NAME=$(basename "$PROJECT_DIR")
-validate_name "$PROJECT_NAME" || { echo "ERROR: invalid project name '$PROJECT_NAME' (must match $NAME_RE)" >&2; exit 1; }
+PROJECT_NAME=$(basename "$PROJECT_DIR")
+validate_name "$PROJECT_NAME" || { echo "ERROR: invalid project dirname '$PROJECT_NAME' (must match $NAME_RE)" >&2; exit 1; }
 
 # Default agents: claude + codex (matches tandem). Override via --agents.
 declare -a AGENTS_ARR
@@ -227,7 +222,7 @@ if [ -z "$NO_LAUNCHERS" ]; then
 fi
 echo ""
 
-# ── Update mode: refresh bin scripts + launchers + skill (idempotent) ──
+# -- Update mode: refresh bin scripts + launchers + skill (idempotent) --
 
 if [ -n "$UPDATE" ]; then
     if [ ! -d "$FAGENTS_TTY_DIR/bin" ]; then
@@ -238,42 +233,18 @@ if [ -n "$UPDATE" ]; then
     cp "$SCRIPT_DIR/bin/wake.sh" "$FAGENTS_TTY_DIR/bin/wake.sh"
     chmod +x "$FAGENTS_TTY_DIR/bin/comms.sh" "$FAGENTS_TTY_DIR/bin/wake.sh"
     echo "Refreshed .fagents-tty/bin/"
+    cleanup_v1x_remnants
     install_launchers_and_skills
+    notice_global_v1x
     exit 0
 fi
 
-# ── Fresh install path ──
+# -- Fresh install path --
 
-# Path conflict check
-REGISTRY_PROJECT_DIR="$REGISTRY_ROOT/$PROJECT_NAME"
-PATH_SIDECAR="$REGISTRY_PROJECT_DIR/.path"
-if [ -f "$PATH_SIDECAR" ]; then
-    EXISTING=$(cat "$PATH_SIDECAR" 2>/dev/null || true)
-    if [ "$EXISTING" != "$PROJECT_DIR" ]; then
-        if [ -z "$FORCE" ]; then
-            echo "ERROR: project name '$PROJECT_NAME' is registered to '$EXISTING'." >&2
-            echo "  Re-run with --force to take over, or pick a different --project name." >&2
-            exit 1
-        fi
-        rm -rf "$REGISTRY_PROJECT_DIR"
-        echo "Forced removal of previous registry: $EXISTING"
-    fi
-fi
-
-# Claim the registry slot for this project NOW (writes .path), closing the
-# gap between forced takeover (or fresh install) and first `register`.
-mkdir -p "$REGISTRY_PROJECT_DIR"
-printf '%s' "$PROJECT_DIR" > "$PATH_SIDECAR"
-
-# Per-project install
-mkdir -p "$FAGENTS_TTY_DIR/bin" "$FAGENTS_TTY_DIR/sessions"
+mkdir -p "$FAGENTS_TTY_DIR/bin"
 cp "$SCRIPT_DIR/bin/comms.sh" "$FAGENTS_TTY_DIR/bin/comms.sh"
 cp "$SCRIPT_DIR/bin/wake.sh" "$FAGENTS_TTY_DIR/bin/wake.sh"
 chmod +x "$FAGENTS_TTY_DIR/bin/comms.sh" "$FAGENTS_TTY_DIR/bin/wake.sh"
-
-if [ ! -f "$FAGENTS_TTY_DIR/config" ]; then
-    printf 'project_name=%s\n' "$PROJECT_NAME" > "$FAGENTS_TTY_DIR/config"
-fi
 
 cat > "$FAGENTS_TTY_DIR/.gitignore" << 'EOF'
 *
@@ -284,7 +255,9 @@ EOF
 
 echo "Created $FAGENTS_TTY_DIR/"
 
+cleanup_v1x_remnants
 install_launchers_and_skills
+notice_global_v1x
 
 echo ""
 echo "=== Setup complete ==="
@@ -293,7 +266,7 @@ echo "Next steps:"
 if [ -z "$NO_LAUNCHERS" ]; then
     echo "  1. Start your agent via the launcher (registers TTY automatically):"
     printf '       ./launch-%s\n' "${AGENTS_ARR[@]}"
-    echo "  2. List who else is reachable:"
+    echo "  2. See who else is reachable (sibling projects with .fagents-tty/):"
     echo "       bash .fagents-tty/bin/comms.sh ls"
     echo "  3. Send a msg:"
     echo "       bash .fagents-tty/bin/comms.sh msg <project>:<agent> \"your message\""

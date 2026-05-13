@@ -10,19 +10,37 @@ If `.fagents-tty/` does not exist, ignore these instructions.
 
 You can talk to agents in OTHER project directories on this machine via TIOCSTI. The transport is `.fagents-tty/`, separate from `.tandem/`.
 
+## Project identity (filesystem is truth)
+
+The project segment of any address is **always the directory basename**. There is no separate "project name" config -- if your project lives at `~/Workspace/autoalpha-engine/`, your project name is `autoalpha-engine`. Renaming the directory renames the project.
+
+## Discovery (where other projects come from)
+
+Discovery walks the **parent directory** of your current project by default. Every sibling that has `.fagents-tty/agents/` is reachable as `<sibling-dirname>:<agent>`. If you set `FAGENTS_TTY_SEARCH_PATH` to a colon-separated list of directories, those replace the default parent (each searched one level deep).
+
+To see what you can reach:
+
+```bash
+bash .fagents-tty/bin/comms.sh ls               # list everyone reachable (excludes your own project)
+bash .fagents-tty/bin/comms.sh ls --project P   # filter to one project basename
+bash .fagents-tty/bin/comms.sh status           # your own registrations + active search roots
+```
+
 ## Registration is automatic
 
-If the user started your session via `./launch-<your-name>` (e.g. `./launch-claude`), your TTY is already registered in this project. You do NOT need to run `comms.sh register` manually. To confirm:
+If the user started your session via `./launch-<your-name>` (e.g. `./launch-claude`), your TTY is already registered. To confirm:
 
 ```bash
 bash .fagents-tty/bin/comms.sh status
 ```
 
-If you see "ERROR: not-registered-from-this-tty" later, register once:
+If you bypass the launcher, register once after starting:
 
 ```bash
 bash .fagents-tty/bin/comms.sh register <your-agent-name>
 ```
+
+`register` is self-cleaning: re-registering with a new name from the same TTY rotates identity (the old name is removed).
 
 ## Receiving a cross-project message
 
@@ -36,9 +54,9 @@ Read the body, do whatever it asks, then **reply by running the literal command 
 
 **Never** reply via `.tandem/bin/handoff.sh msg` -- that is a different transport for in-project tandem coordination and would route to the wrong TTY.
 
-## Sending a message (when the user asks)
+## Sending a message
 
-When the user says something like "msg the engine team", "send X to the orchestrator", or "ask the foo project about Y", translate it to a `comms.sh msg` call:
+When the user says "msg the engine team", "send X to the orchestrator", or "ask the foo project about Y", translate it to a `comms.sh msg` call:
 
 ```bash
 # 1. If you don't know the exact address, discover first:
@@ -59,14 +77,14 @@ If the user gives a relative reference like "../autoalpha-engine", the project n
 ## Exit codes for `msg`
 
 - `0` delivered
-- `1` usage / invalid args / invalid address
-- `2` no such address (target unregistered)
-- `3` sudo/TIOCSTI failure
+- `1` usage / invalid args / invalid address / empty FAGENTS_TTY_SEARCH_PATH component
+- `2` no such project or no such agent (zero matches)
+- `3` wake failure (TTY device path rejected by regex, or TIOCSTI failed)
 - `4` delivered but body was truncated
 - `5` empty body after sanitization
 - `6` you are not registered in this project from this TTY (run `register`)
-- `7` project config missing or invalid
-- `8` (unregister only) registry slot belongs to a different project directory
+- `7` project directory name is invalid (does not match `^[A-Za-z0-9_][A-Za-z0-9_-]*$`)
+- `9` ambiguous target (more than one project matches across `FAGENTS_TTY_SEARCH_PATH` roots)
 
 `4` only fires on successful delivery. `3` overrides `4` -- truncation never masks delivery failure.
 

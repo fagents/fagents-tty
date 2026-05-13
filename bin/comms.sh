@@ -6,76 +6,55 @@
 # Address format: <project>:<agent> where both segments match
 #   ^[A-Za-z0-9_][A-Za-z0-9_-]*$
 #
-# Registry layout (global):
-#   ~/.fagents-tty/registry/<project>/<agent>.tty   -- TTY device path
-#   ~/.fagents-tty/registry/<project>/.path         -- project directory
+# v2 data model: per-project only. No global registry, no config file, no
+# sessions/ dir. Layout:
+#   <project>/.fagents-tty/agents/<agent>.tty   -- contents: TTY device path
+# Project name == basename of project directory. Filesystem is truth.
 #
-# Sender identity (project-local):
-#   <project>/.fagents-tty/sessions/<tty-basename>.agent
+# Discovery (used by `ls` and `msg`):
+#   - Default: dirname "$PROJECT_ROOT"  (parent dir of this project)
+#   - Override: FAGENTS_TTY_SEARCH_PATH (colon-separated, no empty components)
 #
 # Env overrides (mostly for tests):
-#   FAGENTS_TTY_REGISTRY_DIR  -- registry root (default: $HOME/.fagents-tty/registry)
 #   FAGENTS_TTY_WAKE_BIN      -- wake.sh path (default: alongside this script)
 #   FAGENTS_TTY_FORCE_TTY     -- skip TTY detection, use this device path
+#   FAGENTS_TTY_SEARCH_PATH   -- override discovery scope
 
 set -euo pipefail
 
-# Private-by-default for everything this script creates: 0700 dirs, 0600 files.
-# fagents-tty assumes same-host/same-UID trust, but the registry and sessions
-# files do not need to be world-readable, so deny group/other at create time
-# rather than relying on whatever umask the caller's shell happens to have.
 umask 077
 
-# ── Paths ──
+# -- Paths --
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 FAGENTS_TTY_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 PROJECT_ROOT="$(cd "$FAGENTS_TTY_DIR/.." && pwd -P)"
-CONFIG_FILE="$FAGENTS_TTY_DIR/config"
-SESSIONS_DIR="$FAGENTS_TTY_DIR/sessions"
+AGENTS_DIR="$FAGENTS_TTY_DIR/agents"
 
-REGISTRY_ROOT="${FAGENTS_TTY_REGISTRY_DIR:-$HOME/.fagents-tty/registry}"
 WAKE_BIN="${FAGENTS_TTY_WAKE_BIN:-$SCRIPT_DIR/wake.sh}"
 
-# ── Helpers ──
+NAME_RE='^[A-Za-z0-9_][A-Za-z0-9_-]*$'
+
+# -- Helpers --
 
 die() { echo "ERROR: $1" >&2; exit "${2:-1}"; }
 
 validate_name() {
     local name="$1"
     [ -z "$name" ] && return 1
-    [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]]
+    [[ "$name" =~ $NAME_RE ]]
 }
 
-# Parse project_name= from config file. Data-only, never source/eval.
-# Scans whole file; rejects unknown keys anywhere; first project_name= wins.
-parse_project_name() {
-    local cfg="$1" line value found=""
-    [ -f "$cfg" ] || return 1
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            ''|'#'*) continue ;;
-        esac
-        case "$line" in
-            project_name=*)
-                if [ -z "$found" ]; then
-                    value="${line#project_name=}"
-                    value="${value#"${value%%[![:space:]]*}"}"
-                    value="${value%"${value##*[![:space:]]}"}"
-                    validate_name "$value" || return 1
-                    found="$value"
-                fi
-                ;;
-            *) return 1 ;;
-        esac
-    done < "$cfg"
-    [ -z "$found" ] && return 1
-    printf '%s' "$found"
-    return 0
+# Derive sender project name from basename of PROJECT_ROOT.
+# Exits 7 if the basename does not satisfy the name regex.
+sender_project_name() {
+    local name
+    name=$(basename "$PROJECT_ROOT")
+    validate_name "$name" || die "invalid-project-dirname '$name' (must match $NAME_RE)" 7
+    printf '%s' "$name"
 }
 
 # Detect own TTY. Returns device path on stdout or returns 1.
-# Honors FAGENTS_TTY_FORCE_TTY override.
 detect_tty() {
     if [ -n "${FAGENTS_TTY_FORCE_TTY:-}" ]; then
         printf '%s' "$FAGENTS_TTY_FORCE_TTY"
@@ -101,52 +80,102 @@ detect_tty() {
     return 0
 }
 
-tty_basename() {
-    printf '%s' "${1##*/}"
+# Compute the discovery search roots. Honors FAGENTS_TTY_SEARCH_PATH if set
+# (rejects empty components pre-split, same pattern as v1.1 --agents parser).
+# Sets the global SEARCH_ROOTS array.
+populate_search_roots() {
+    SEARCH_ROOTS=()
+    if [ -n "${FAGENTS_TTY_SEARCH_PATH:-}" ]; then
+        local raw="$FAGENTS_TTY_SEARCH_PATH"
+        case "$raw" in
+            :*|*:|*::*) die "invalid-search-path: empty component in FAGENTS_TTY_SEARCH_PATH '$raw'" 1 ;;
+        esac
+        local IFS=':'
+        local -a tmp
+        read -ra tmp <<< "$raw"
+        local root
+        for root in "${tmp[@]}"; do
+            [ -z "$root" ] && die "invalid-search-path: empty component in FAGENTS_TTY_SEARCH_PATH '$raw'" 1
+            SEARCH_ROOTS+=("$root")
+        done
+    else
+        SEARCH_ROOTS=("$(dirname "$PROJECT_ROOT")")
+    fi
 }
 
-# ── Commands ──
+# Walk own agents/*.tty, find the one whose contents match my detected TTY.
+# Sets SENDER_AGENT. Exits 6 on zero or multiple matches.
+resolve_sender_agent() {
+    local self_tty match_count="" agent tty_file contents
+    self_tty=$(detect_tty) || die "cannot-detect-tty" 1
+    SENDER_AGENT=""
+    match_count=0
+    if [ -d "$AGENTS_DIR" ]; then
+        for tty_file in "$AGENTS_DIR"/*.tty; do
+            [ -f "$tty_file" ] || continue
+            contents=$(cat "$tty_file" 2>/dev/null)
+            if [ "$contents" = "$self_tty" ]; then
+                agent=$(basename "$tty_file" .tty)
+                SENDER_AGENT="$agent"
+                match_count=$((match_count + 1))
+            fi
+        done
+    fi
+    if [ "$match_count" -eq 0 ]; then
+        echo "ERROR: not-registered-from-this-tty (run: bash $SCRIPT_DIR/comms.sh register <name>)" >&2
+        exit 6
+    fi
+    if [ "$match_count" -gt 1 ]; then
+        echo "ERROR: ambiguous-sender-tty (multiple agents claim $self_tty in this project)" >&2
+        exit 6
+    fi
+}
+
+# -- Commands --
 
 cmd_register() {
     local name="${1:-}"
     [ -z "$name" ] && die "Usage: comms.sh register <agent-name>" 1
     validate_name "$name" || die "invalid-name '$name'" 1
 
-    local project_name
-    project_name=$(parse_project_name "$CONFIG_FILE") || die "no-project-config" 7
+    # Sanity: project dir name must be valid (defends against agents/ being
+    # created inside a malformed project dir).
+    sender_project_name >/dev/null
 
     local tty_dev
     tty_dev=$(detect_tty) || die "cannot-detect-tty (set FAGENTS_TTY_FORCE_TTY=/dev/... to override)" 1
 
-    local registry_dir="$REGISTRY_ROOT/$project_name"
-    local path_sidecar="$registry_dir/.path"
+    mkdir -p "$AGENTS_DIR"
+    chmod 0700 "$AGENTS_DIR"
 
-    if [ -f "$path_sidecar" ]; then
-        local existing
-        existing=$(cat "$path_sidecar")
-        if [ "$existing" != "$PROJECT_ROOT" ]; then
-            die "project-name-conflict: '$project_name' is registered to '$existing'. Re-run setup.sh with --force or pick a different --project name." 1
-        fi
+    # Self-cleaning: remove any existing entries that point at MY TTY. End
+    # state: at most one agents/<name>.tty per TTY in this project.
+    local tty_file contents
+    if [ -d "$AGENTS_DIR" ]; then
+        for tty_file in "$AGENTS_DIR"/*.tty; do
+            [ -f "$tty_file" ] || continue
+            contents=$(cat "$tty_file" 2>/dev/null)
+            if [ "$contents" = "$tty_dev" ]; then
+                rm -f "$tty_file"
+            fi
+        done
     fi
 
-    mkdir -p "$registry_dir"
-    [ -f "$path_sidecar" ] || printf '%s' "$PROJECT_ROOT" > "$path_sidecar"
-    printf '%s' "$tty_dev" > "$registry_dir/$name.tty"
+    printf '%s' "$tty_dev" > "$AGENTS_DIR/$name.tty"
+    chmod 0600 "$AGENTS_DIR/$name.tty"
 
-    mkdir -p "$SESSIONS_DIR"
-    printf '%s' "$name" > "$SESSIONS_DIR/$(tty_basename "$tty_dev").agent"
-
-    echo "Registered $project_name:$name -> $tty_dev"
+    local proj
+    proj=$(sender_project_name)
+    echo "Registered $proj:$name -> $tty_dev"
 }
 
 cmd_msg() {
     local target="${1:-}"
-    local body="${2:-}"
     [ -z "$target" ] && die "Usage: comms.sh msg <project>:<agent> <body>" 1
-    # Body absent: usage error. Empty-string body falls through to sanitize -> exit 5.
     if [ "$#" -lt 2 ]; then
         die "Usage: comms.sh msg <project>:<agent> <body>" 1
     fi
+    local body="$2"
 
     # 1. Validate address syntax
     case "$target" in
@@ -163,33 +192,21 @@ cmd_msg() {
     validate_name "$target_project" || die "invalid-address '$target' (project segment)" 1
     validate_name "$target_agent" || die "invalid-address '$target' (agent segment)" 1
 
-    # 2. Sender sessions file (exit 6 if missing)
-    local self_tty
-    self_tty=$(detect_tty) || die "cannot-detect-tty" 1
-    local sessions_file
-    sessions_file="$SESSIONS_DIR/$(tty_basename "$self_tty").agent"
-    [ -f "$sessions_file" ] || { echo "ERROR: not-registered-from-this-tty (run: bash $SCRIPT_DIR/comms.sh register <name>)" >&2; exit 6; }
-    local sender_agent
-    sender_agent=$(cat "$sessions_file")
-
-    # 3. Project config (exit 7 if missing/invalid)
+    # 2. Sender identity
     local sender_project
-    sender_project=$(parse_project_name "$CONFIG_FILE") || { echo "ERROR: no-project-config" >&2; exit 7; }
+    sender_project=$(sender_project_name)
+    resolve_sender_agent  # sets SENDER_AGENT, exits 6 on failure
 
-    # 4. Sanitize body (exit 5 if empty after normalization)
-    # Replace control bytes with spaces, collapse runs, trim.
+    # 3. Sanitize body. Replace control bytes with spaces, collapse runs, trim.
     local sanitized truncated=""
     sanitized=$(printf '%s' "$body" | LC_ALL=C tr '[:cntrl:]' ' ' | LC_ALL=C tr -s ' ' | sed 's/^ *//;s/ *$//')
     if [ -z "$sanitized" ]; then
         echo "ERROR: empty-body" >&2
         exit 5
     fi
-    # Byte-length cap (not codepoint count -- plan and README promise bytes).
-    # Use a tempfile instead of `printf | head -c` because under `set -o pipefail`
-    # a very large body causes printf to be killed by SIGPIPE when head closes
-    # its stdin early, making the assignment fail with exit 141.
+    # Byte-length cap via tempfile (avoids SIGPIPE under pipefail on large bodies).
     local tmpfile byte_len
-    tmpfile=$(mktemp) || die "mktemp failed (cannot create tempfile for body sanitization)" 1
+    tmpfile=$(mktemp) || die "mktemp failed" 1
     printf '%s' "$sanitized" > "$tmpfile"
     byte_len=$(wc -c < "$tmpfile" | tr -d ' ')
     if [ "$byte_len" -gt 800 ]; then
@@ -199,18 +216,54 @@ cmd_msg() {
     fi
     rm -f "$tmpfile"
 
-    # 5. Target registry lookup (exit 2 if missing)
-    local target_file="$REGISTRY_ROOT/$target_project/$target_agent.tty"
-    [ -f "$target_file" ] || { echo "ERROR: no-such-address '$target'" >&2; exit 2; }
+    # 4. Build search roots
+    populate_search_roots
 
-    # 6. Build envelope
-    local envelope="[FAGENTS-TTY from $sender_project:$sender_agent]: $sanitized. Reply: bash .fagents-tty/bin/comms.sh msg $sender_project:$sender_agent \"...\""
+    # 5. Collect PROJECT-LEVEL matches across search roots
+    local -a project_matches=()
+    local root candidate_dir
+    for root in "${SEARCH_ROOTS[@]}"; do
+        candidate_dir="$root/$target_project/.fagents-tty/agents"
+        [ -d "$candidate_dir" ] && project_matches+=("$candidate_dir")
+    done
 
-    # 7. Invoke wake. Propagate wake's exit code on failure; else exit 4 if truncated, else 0.
+    # 6. Ambiguity check (project-level, before agent file lookup)
+    if [ "${#project_matches[@]}" -gt 1 ]; then
+        echo "ERROR: ambiguous-target '$target' (matches multiple search roots):" >&2
+        local m
+        for m in "${project_matches[@]}"; do
+            echo "  $m" >&2
+        done
+        exit 9
+    fi
+
+    # 7. No project match
+    if [ "${#project_matches[@]}" -eq 0 ]; then
+        echo "ERROR: no-such-project '$target_project' in any search root" >&2
+        exit 2
+    fi
+
+    # 8. Single match -- check agent file
+    local target_agents_dir="${project_matches[0]}"
+    local target_file="$target_agents_dir/$target_agent.tty"
+    if [ ! -f "$target_file" ]; then
+        echo "ERROR: no-such-agent '$target' in $target_agents_dir" >&2
+        exit 2
+    fi
+    local target_tty
+    target_tty=$(cat "$target_file")
+
+    # 9. Build envelope and invoke wake
+    local envelope="[FAGENTS-TTY from $sender_project:$SENDER_AGENT]: $sanitized. Reply: bash .fagents-tty/bin/comms.sh msg $sender_project:$SENDER_AGENT \"...\""
+
     local wake_rc=0
-    "$WAKE_BIN" "$target" "$envelope" || wake_rc=$?
+    "$WAKE_BIN" "$target_tty" "$envelope" || wake_rc=$?
     if [ "$wake_rc" -ne 0 ]; then
-        exit "$wake_rc"
+        # Any wake failure (usage=1, regex-reject=2, TIOCSTI fail=3) maps to
+        # msg's documented wake-failure code 3. Preserves the msg API contract
+        # where exit 2 means "no such project/agent" (lookup-miss), not "the
+        # target's registered TTY path was corrupt/invalid".
+        exit 3
     fi
     if [ -n "$truncated" ]; then
         exit 4
@@ -233,75 +286,84 @@ cmd_ls() {
     if [ -n "$filter" ]; then
         validate_name "$filter" || die "invalid-name '$filter'" 1
     fi
-    [ -d "$REGISTRY_ROOT" ] || return 0
-    local project_dir project agent tty_file
-    while IFS= read -r project_dir; do
-        project=$(basename "$project_dir")
-        [ -n "$filter" ] && [ "$project" != "$filter" ] && continue
-        for tty_file in "$project_dir"/*.tty; do
-            [ -f "$tty_file" ] || continue
-            agent=$(basename "$tty_file" .tty)
-            printf '%s:%s %s\n' "$project" "$agent" "$(cat "$tty_file")"
+
+    populate_search_roots
+
+    # Walk search roots, list <root>/*/.fagents-tty/agents/*.tty
+    # Skip the current project's own agents dir. With multiple roots, append
+    # @<root> to each line if more than one root is configured.
+    local root project_dir project_name agents_dir tty_file agent
+    local multi_root=""
+    [ "${#SEARCH_ROOTS[@]}" -gt 1 ] && multi_root=1
+
+    local lines=()
+    for root in "${SEARCH_ROOTS[@]}"; do
+        [ -d "$root" ] || continue
+        for project_dir in "$root"/*/; do
+            [ -d "$project_dir" ] || continue
+            project_dir="${project_dir%/}"
+            project_name=$(basename "$project_dir")
+            # Skip the current project (we're listing "who else")
+            [ "$project_dir" = "$PROJECT_ROOT" ] && continue
+            # Skip names that fail validation (might be unrelated dirs in the root)
+            validate_name "$project_name" || continue
+            [ -n "$filter" ] && [ "$project_name" != "$filter" ] && continue
+            agents_dir="$project_dir/.fagents-tty/agents"
+            [ -d "$agents_dir" ] || continue
+            for tty_file in "$agents_dir"/*.tty; do
+                [ -f "$tty_file" ] || continue
+                agent=$(basename "$tty_file" .tty)
+                local line tty_path
+                tty_path=$(cat "$tty_file")
+                if [ -n "$multi_root" ]; then
+                    line=$(printf '%s:%s %s @%s' "$project_name" "$agent" "$tty_path" "$root")
+                else
+                    line=$(printf '%s:%s %s' "$project_name" "$agent" "$tty_path")
+                fi
+                lines+=("$line")
+            done
         done
-    done < <(find "$REGISTRY_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+    done
+    [ "${#lines[@]}" -eq 0 ] && return 0
+    printf '%s\n' "${lines[@]}" | LC_ALL=C sort
 }
 
 cmd_status() {
-    local project_name
-    project_name=$(parse_project_name "$CONFIG_FILE") || die "no-project-config" 7
-    echo "project_name: $project_name"
+    local proj
+    proj=$(sender_project_name)
+    echo "project_name: $proj"
     echo "project_root: $PROJECT_ROOT"
-    echo "registry: $REGISTRY_ROOT/$project_name"
     echo "Registered from this project:"
-    local agent_dir="$REGISTRY_ROOT/$project_name"
-    if [ -d "$agent_dir" ]; then
+    if [ -d "$AGENTS_DIR" ]; then
         local tty_file agent
-        for tty_file in "$agent_dir"/*.tty; do
+        for tty_file in "$AGENTS_DIR"/*.tty; do
             [ -f "$tty_file" ] || continue
             agent=$(basename "$tty_file" .tty)
             printf '  %s %s\n' "$agent" "$(cat "$tty_file")"
         done
     fi
+    populate_search_roots
+    echo "Search roots (for ls / msg discovery):"
+    local root
+    for root in "${SEARCH_ROOTS[@]}"; do
+        echo "  $root"
+    done
 }
 
 cmd_unregister() {
     local name="${1:-}"
     [ -z "$name" ] && die "Usage: comms.sh unregister <agent-name>" 1
     validate_name "$name" || die "invalid-name '$name'" 1
-
-    local project_name
-    project_name=$(parse_project_name "$CONFIG_FILE") || die "no-project-config" 7
-
-    local registry_dir="$REGISTRY_ROOT/$project_name"
-    local path_sidecar="$registry_dir/.path"
-    if [ -f "$path_sidecar" ]; then
-        local existing
-        existing=$(cat "$path_sidecar")
-        if [ "$existing" != "$PROJECT_ROOT" ]; then
-            echo "ERROR: unregister-foreign-project: '$project_name' belongs to '$existing'" >&2
-            exit 8
-        fi
+    local target="$AGENTS_DIR/$name.tty"
+    if [ -f "$target" ]; then
+        rm -f "$target"
     fi
-
-    local tty_file="$registry_dir/$name.tty"
-    if [ -f "$tty_file" ]; then
-        local tty_dev
-        tty_dev=$(cat "$tty_file")
-        rm -f "$tty_file"
-        local sessions_file
-        sessions_file="$SESSIONS_DIR/$(tty_basename "$tty_dev").agent"
-        if [ -f "$sessions_file" ]; then
-            local current
-            current=$(cat "$sessions_file")
-            if [ "$current" = "$name" ]; then
-                rm -f "$sessions_file"
-            fi
-        fi
-    fi
-    echo "Unregistered $project_name:$name"
+    local proj
+    proj=$(sender_project_name)
+    echo "Unregistered $proj:$name"
 }
 
-# ── Dispatch ──
+# -- Dispatch --
 
 CMD="${1:-status}"
 shift || true
