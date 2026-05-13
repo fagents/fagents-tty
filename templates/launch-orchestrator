@@ -1,0 +1,11 @@
+#!/bin/bash
+# Reference launcher for a single-agent project that wants auto-register.
+#
+# Copy to your project root, adapt the agent name and CLI launcher, then
+# start your agent via ./launch-orchestrator instead of `claude`/`codex`.
+
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+bash "$PROJECT_DIR/.fagents-tty/bin/comms.sh" register orchestrator
+exec claude
