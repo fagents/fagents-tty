@@ -814,6 +814,18 @@ EOF
     assert_contains "45c: fagents-tty register line inserted" "$content" '[ -x "$ROOT/.fagents-tty/bin/comms.sh" ] && bash "$ROOT/.fagents-tty/bin/comms.sh" register claude'
     # shellcheck disable=SC2016
     assert_contains "45d: exec preserved" "$content" 'exec claude "$@"'
+    # Insertion order: the fagents-tty register line must appear BEFORE the
+    # first `exec` line, otherwise registration runs after the CLI has already
+    # taken over the TTY.
+    local fagents_line exec_line
+    fagents_line=$(grep -n 'fagents-tty/bin/comms.sh' "$PROJECT_DIR/launch-claude" | head -1 | cut -d: -f1)
+    exec_line=$(grep -n '^exec ' "$PROJECT_DIR/launch-claude" | head -1 | cut -d: -f1)
+    if [ -n "$fagents_line" ] && [ -n "$exec_line" ] && [ "$fagents_line" -lt "$exec_line" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        FAILED_DETAILS+=("45e: fagents-tty register line not before exec (fagents=$fagents_line, exec=$exec_line)")
+    fi
     teardown_env
 }
 

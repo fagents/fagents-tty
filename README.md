@@ -152,7 +152,7 @@ Exit codes: `0` delivered, `1` usage, `2` path failed regex validation, `3` sudo
 bash test/test_comms.sh
 ```
 
-53 test functions, 161 assertions. All TIOCSTI is mocked; the python encode path that real `wake.sh` uses is verified independently (test 33). Real-TTY smoke test is manual:
+54 test functions, 164 assertions. All TIOCSTI is mocked except test 32 (real `wake.sh` regex on six valid + six invalid TTY paths) and test 33 (python encode loop on split UTF-8). Real-TTY smoke test is manual:
 
 ```bash
 # Two sibling projects in the same parent dir, each on its own TTY.
